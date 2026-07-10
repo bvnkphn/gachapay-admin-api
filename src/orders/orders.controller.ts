@@ -1,0 +1,228 @@
+import {
+    Controller, Get, Post, Patch, Body, Param, Query,
+    UseGuards, Req, BadRequestException, Res,
+} from '@nestjs/common';
+import { Response } from 'express';
+import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { AdminGuard } from '../auth/guards/admin.guard';
+import { OrdersService } from './orders.service';
+import { CreateOrderDto } from './dto/create-order.dto';
+import { ExternalGameService } from '../games/external-game.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { CouponsService } from '../coupons/coupons.service';
+
+@ApiTags('Orders')
+@ApiBearerAuth()
+@Controller('orders')
+export class OrdersController {
+    constructor(
+        private readonly ordersService: OrdersService,
+        private readonly externalGameService: ExternalGameService,
+        private readonly prisma: PrismaService,
+        private readonly couponsService: CouponsService,
+    ) {}
+
+    // ─── User endpoints ──────────────────────────────────────────────────────
+
+    @Get()
+    @UseGuards(JwtAuthGuard)
+    async findAll(@Req() req: any) {
+        return this.ordersService.findAll(req.user.id);
+    }
+
+    @Get('me/recent')
+    @UseGuards(JwtAuthGuard)
+    async getRecentOrders(@Req() req: any) {
+        const recent = await this.ordersService.findRecentByUser(req.user.id);
+        return { recent_orders: recent };
+    }
+
+    // ─── Admin endpoints ─────────────────────────────────────────────────────
+
+    @Get('admin/all')
+    @UseGuards(JwtAuthGuard, AdminGuard)
+    async findAllForAdmin(
+        @Query('page')   page   = '1',
+        @Query('limit')  limit  = '20',
+        @Query('status') status?: string,
+        @Query('search') search?: string,
+        @Query('gameId') gameId?: string,
+    ) {
+        return this.ordersService.findAllForAdmin({
+            page:  Number.parseInt(page, 10),
+            limit: Number.parseInt(limit, 10),
+            status, search, gameId,
+        });
+    }
+
+    @Get('admin/stats')
+    @UseGuards(JwtAuthGuard, AdminGuard)
+    async getAdminDashboardStats(@Query('days') days = '7') {
+        return this.ordersService.getAdminDashboardStats(parseInt(days, 10));
+    }
+
+    @Get('admin/revenue-by-game')
+    @UseGuards(JwtAuthGuard, AdminGuard)
+    async getRevenueByGame(@Query('gameId') gameId?: string) {
+        return this.ordersService.getRevenueByGame(gameId);
+    }
+
+    @Get('admin/export')
+    @UseGuards(JwtAuthGuard, AdminGuard)
+    async exportOrders(
+        @Query('status')   status?: string,
+        @Query('dateFrom') dateFrom?: string,
+        @Query('dateTo')   dateTo?: string,
+        @Res() res?: Response,
+    ) {
+        const rows = await this.ordersService.adminExportOrders({ status, dateFrom, dateTo });
+
+        const headers = ['Order ID','UID','Email','Game','Package','Price','Discount','Final','Method','Coupon','Status','Created At'];
+        const csvLines = [
+            headers.join(','),
+            ...rows.map(r => [
+                r.order_id, r.uid, r.email, `"${r.game}"`, `"${r.package}"`,
+                r.price, r.discount, r.final, r.method, r.coupon, r.status, r.created_at,
+            ].join(',')),
+        ];
+        const csv = '\ufeff' + csvLines.join('\n');
+
+        const filename = `orders_${new Date().toISOString().slice(0, 10)}.csv`;
+        res!.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res!.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res!.send(csv);
+    }
+
+    @Patch('admin/:id/status')
+    @UseGuards(JwtAuthGuard, AdminGuard)
+    async adminUpdateStatus(
+        @Param('id') id: string,
+        @Body('status') status: string,
+        @Req() req: any,
+    ) {
+        if (!status) throw new BadRequestException('กรุณาระบุ status');
+        return this.ordersService.adminUpdateStatus(BigInt(id), status, req.user.id);
+    }
+
+    @Post('admin/:id/retry')
+    @UseGuards(JwtAuthGuard, AdminGuard)
+    async adminRetryOrder(@Param('id') id: string, @Req() req: any) {
+        return this.ordersService.adminRetryOrder(BigInt(id), req.user.id);
+    }
+
+    // ─── Shared ──────────────────────────────────────────────────────────────
+
+    @Get('public/stats')
+    async getPublicStats() {
+        return this.ordersService.getPublicStats();
+    }
+
+    @Get('prepare-payment')
+    @UseGuards(JwtAuthGuard)
+    async preparePayment(@Req() req: any) {
+        const orderId = req.query.orderId;
+        const userId  = req.query.userId || req.user.id;
+        if (!orderId) throw new BadRequestException('Order ID is required');
+        return this.ordersService.prepareOrderForPayment(BigInt(orderId), BigInt(userId));
+    }
+
+    @Get(':id')
+    @UseGuards(JwtAuthGuard)
+    async findOne(@Param('id') id: string, @Req() req: any) {
+        return this.ordersService.findByIdForUser(BigInt(id), req.user.id);
+    }
+
+    @Post()
+    @UseGuards(JwtAuthGuard)
+    async create(@Req() req: any, @Body() dto: CreateOrderDto) {
+        const userId = req.user.id;
+        const email = dto.email || req.user.email;
+        if (!email) throw new BadRequestException('Email is required for order creation');
+
+        let gameId: bigint | null = null;
+        let externalGameSlug: string | null = null;
+        if (typeof dto.gameId === 'string') {
+            externalGameSlug = dto.gameId;
+        } else if (typeof dto.gameId === 'number' || typeof dto.gameId === 'bigint') {
+            gameId = BigInt(dto.gameId);
+        }
+
+        let packageId: bigint | null = null;
+        let externalPackageSku: string | null = null;
+        if (typeof dto.packageId === 'string') {
+            // redundant assignment removed
+        } else if (typeof dto.packageId === 'number' || typeof dto.packageId === 'bigint') {
+            const packageIdBig = BigInt(dto.packageId);
+            const packageExists = await this.prisma.gamePackage.findUnique({
+                where: { id: packageIdBig },
+                select: { id: true },
+            });
+            if (packageExists) {
+                packageId = packageIdBig;
+            } else {
+                externalPackageSku = `${dto.packageName}_${dto.packageId}`.toLowerCase().replace(/\s+/g, '_');
+                // redundant assignment removed
+            }
+        }
+
+        // Validate coupon if provided
+        let discountAmount = 0;
+        let finalPrice = dto.packagePrice;
+        let couponCode: string | null = null;
+
+        if (dto.couponCode) {
+            try {
+                const validation = await this.couponsService.validateCoupon({
+                    code: dto.couponCode,
+                    gameId: gameId ? Number(gameId) : undefined,
+                    packageId: packageId ? Number(packageId) : undefined,
+                    amount: dto.packagePrice
+                }, userId || BigInt(1)); // fallback to 1 (default user ID) if guest
+
+                if (validation && validation.success && validation.data) {
+                    couponCode = validation.data.code;
+                    discountAmount = validation.data.discountAmount;
+                    finalPrice = validation.data.finalAmount;
+                } else {
+                    throw new BadRequestException(validation.message || 'คูปองไม่ถูกต้อง');
+                }
+            } catch (couponErr: any) {
+                throw new BadRequestException(couponErr.message || 'เกิดข้อผิดพลาดในการตรวจสอบคูปอง');
+            }
+        }
+
+        // Calculate VAT on top of the final price (after discount)
+        const vatSetting = await this.prisma.systemSetting.findUnique({
+            where: { key: 'payment_vat_rate' },
+        });
+        const vatRate = vatSetting ? parseFloat(vatSetting.value) ?? 7.0 : 7.0;
+        const vatAmountVal = finalPrice * (vatRate / 100);
+        finalPrice = Math.round((finalPrice + vatAmountVal) * 100) / 100;
+
+        const order = await this.ordersService.create({
+            userId:           userId,
+            gameId,
+            externalGameSlug,
+            gameName:         dto.gameName,
+            packageId,
+            externalPackageSku,
+            packageName:      dto.packageName,
+            packagePrice:     dto.packagePrice,
+            uid:              dto.uid,
+            email,
+            paymentMethod:    dto.paymentMethod || undefined,
+            couponCode,
+            discountAmount,
+            finalPrice,
+        });
+
+        return {
+            ...order,
+            id: order.id.toString(),
+            userId: order.userId?.toString() || null,
+            gameId: order.gameId?.toString() || null,
+            packageId: order.packageId?.toString() || null,
+        };
+    }
+}
